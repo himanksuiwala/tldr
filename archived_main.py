@@ -1,9 +1,10 @@
 import ollama
 import psycopg2
 
-EMBEDDING_MODEL = 'hf.co/CompendiumLabs/bge-base-en-v1.5-gguf'
-LANGUAGE_MODEL = 'hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF'
-CONNECTION_STRING = ""
+from settings import settings 
+
+EMBEDDING_MODEL = settings.model_embedding
+LANGUAGE_MODEL = settings.model_language
 
 dataset = []
 
@@ -70,7 +71,7 @@ def get_vector_embeddings(query_string):
     return ollama.embed(model=EMBEDDING_MODEL, input=query_string)['embeddings'][0]
 
 def main():
-    conn = psycopg2.connect(CONNECTION_STRING)
+    conn = psycopg2.connect(settings.database_url)
     cur = conn.cursor()
     
     load_dataset()
