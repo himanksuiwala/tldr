@@ -1,8 +1,9 @@
 import asyncpg
 
-from settings import settings
+from .settings import settings
 
 DATABASE_URL = settings.database_url
+
 
 class Postgres:
     def __init__(self, database_url: str):
@@ -13,5 +14,6 @@ class Postgres:
 
     async def disconnect(self):
         self.pool.close()
+
 
 database = Postgres(DATABASE_URL)

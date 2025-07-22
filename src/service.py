@@ -1,10 +1,15 @@
-from pydantic import BaseModel
-from database.connection import database
+import logging
+from typing import List
 
+import ollama
 
-class Embedding(BaseModel):
-    chunk: str
-    embedding: str
+from .connection import database
+from .models import Embedding
+from .settings import settings
+
+logger = logging.getLogger(__name__)
+
+EMBEDDING_MODEL = settings.model_embedding
 
 
 async def store_embeddings(embedded_value: list, chunk: str):
@@ -36,3 +41,21 @@ async def get_embeddings(embedded_value: list, top_k: int = 5) -> list[Embedding
             )
             for row in result
         ]
+
+
+def get_vector_embeddings(text: str) -> List[float]:
+    """
+    Generate vector embeddings for the given text using Ollama.
+    """
+    try:
+        logger.debug(f"Generating embeddings for text of length: {len(text)}")
+
+        response = ollama.embed(model=EMBEDDING_MODEL, input=text)
+        embedding = response["embeddings"][0]
+
+        logger.debug(f"Generated embedding with dimension: {len(embedding)}")
+        return embedding
+
+    except Exception as e:
+        logger.error(f"Failed to generate embeddings: {e}")
+        raise Exception(f"Embedding generation failed: {str(e)}")

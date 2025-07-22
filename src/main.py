@@ -4,12 +4,11 @@ from contextlib import asynccontextmanager
 
 import ollama
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
 
-from database.connection import database
-from model.Embeddings import get_embeddings
-from services.embedding import get_vector_embeddings
-from settings import settings
+from .connection import database
+from .models import Chat
+from .service import get_embeddings, get_vector_embeddings
+from .settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +33,6 @@ async def lifespan(app: FastAPI):
     logger.info("Disconnected from the database.")
 
 
-class QueryModel(BaseModel):
-    query: str
-
-
 app = FastAPI(lifespan=lifespan)
 
 
@@ -52,7 +47,7 @@ async def upload(file):
 
 
 @app.post("/api/query")
-async def query(request: QueryModel):
+async def query(request: Chat):
     try:
         generated_embeddings = get_vector_embeddings(request.query)
 
