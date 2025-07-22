@@ -1,8 +1,9 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 import ollama
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from database.connection import database
@@ -81,3 +82,63 @@ async def query(request: QueryModel):
     except Exception as e:
         logger.error(f"Query processing failed: {e}")
         return {"error": f"Query processing failed: {str(e)}"}
+
+
+@app.websocket("/api/chat")
+async def chat(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            query_text = await websocket.receive_text()
+
+            try:
+                generated_embeddings = get_vector_embeddings(query_text)
+
+                retrieved_knowledge = await get_embeddings(generated_embeddings)
+                logger.debug(
+                    f"Retrieved {len(retrieved_knowledge)} chunks from database"
+                )
+
+                context_chunks = [embedding.chunk for embedding in retrieved_knowledge]
+
+                instruction_prompt = f"""You are a helpful chatbot.
+        Use only the following pieces of context to answer the question. Don't make up any new information:
+        {chr(10).join([f" - {chunk}" for chunk in context_chunks])}
+        """
+                buffer = []
+                flush_interval = 0.2
+
+                async def flush_buffer():
+                    nonlocal buffer
+                    if buffer:
+                        await websocket.send_text("".join(buffer))
+                        buffer.clear()
+
+                response = ollama.chat(
+                    model=settings.model_language,
+                    messages=[
+                        {"role": "system", "content": instruction_prompt},
+                        {"role": "user", "content": query_text},
+                    ],
+                    stream=True,
+                )
+
+                for chunk in response:
+                    content = chunk["message"]["content"]
+                    buffer.append(content)
+                    if len(buffer) >= 5:
+                        await flush_buffer()
+                    else:
+                        await asyncio.sleep(flush_interval)
+
+                await flush_buffer()
+                logger.info(f"Completed response for query: {query_text}")
+
+            except Exception as e:
+                logger.error(f"Chat processing failed: {e}")
+                error_message = f"Error processing your message: {str(e)}"
+                await websocket.send_text(error_message)
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
+        await websocket.close()
