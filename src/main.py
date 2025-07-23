@@ -1,31 +1,33 @@
 import asyncio
 import logging
+import tempfile
 from contextlib import asynccontextmanager
 
 import ollama
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import pymupdf
+from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect
 
 from .connection import database
 from .models import Chat
-from .service import get_embeddings, get_vector_embeddings
+from .service import get_embeddings, get_vector_embeddings, store_chunks_with_embeddings
 from .settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    max_retries = 3
-    for attempt in range(max_retries):
+async def lifespan(fastapi_app: FastAPI):
+    maximum_connection_retries = 3
+    for connection_attempt in range(maximum_connection_retries):
         try:
             await database.connect()
             logger.info("Connected to the database successfully.")
             break
-        except Exception as e:
+        except Exception as database_connection_exception:
             logger.error(
-                f"Attempt {attempt + 1} to connect to the database failed: {e}"
+                f"Attempt {connection_attempt + 1} to connect to the database failed: {database_connection_exception}"
             )
-            if attempt == max_retries - 1:
+            if connection_attempt == maximum_connection_retries - 1:
                 logger.error("Max retries reached. Unable to connect to the database.")
                 raise
     yield
@@ -42,98 +44,131 @@ def read_root():
 
 
 @app.post("/api/upload")
-async def upload(file):
-    return {"message": "File uploaded successfully"}
+async def upload(uploaded_file: UploadFile):
+    temporary_file_path = None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temporary_file:
+        file_contents = await uploaded_file.read()
+        temporary_file.write(file_contents)
+        temporary_file_path = temporary_file.name
+
+    extracted_document_text = ""
+    pdf_document = pymupdf.open(temporary_file_path)
+    for page_number, current_page in enumerate(pdf_document):
+        raw_page_text = current_page.get_text()
+
+        processed_page_text = str.strip(raw_page_text)
+
+        extracted_document_text += processed_page_text
+        text_lines = extracted_document_text.split("\n")
+
+    processed_text_chunks = [
+        text_chunk.strip() for text_chunk in text_lines if text_chunk.strip()
+    ]
+
+    await store_chunks_with_embeddings(processed_text_chunks)
+
+    return {
+        "message": f"Successfully uploaded and stored {len(processed_text_chunks)} chunks"
+    }
 
 
 @app.post("/api/query")
-async def query(request: Chat):
+async def query(chat_request: Chat):
     try:
-        generated_embeddings = get_vector_embeddings(request.query)
+        user_query_embeddings = get_vector_embeddings(chat_request.query)
 
-        retrieved_knowledge = await get_embeddings(generated_embeddings)
-        logger.debug(f"Retrieved {len(retrieved_knowledge)} chunks from database")
+        similar_knowledge_chunks = await get_embeddings(user_query_embeddings)
+        logger.debug(f"Retrieved {len(similar_knowledge_chunks)} chunks from database")
 
-        context_chunks = [embedding.chunk for embedding in retrieved_knowledge]
+        contextual_text_chunks = [
+            knowledge_embedding.chunk
+            for knowledge_embedding in similar_knowledge_chunks
+        ]
 
-        instruction_prompt = f"""You are a helpful chatbot.
+        system_instruction_prompt = f"""You are a helpful chatbot.
         Use only the following pieces of context to answer the question. Don't make up any new information:
-        {chr(10).join([f" - {chunk}" for chunk in context_chunks])}
+        {chr(10).join([f" - {text_chunk}" for text_chunk in contextual_text_chunks])}
         """
 
-        response = ollama.chat(
+        llm_response = ollama.chat(
             model=settings.model_language,
             messages=[
-                {"role": "system", "content": instruction_prompt},
-                {"role": "user", "content": request.query},
+                {"role": "system", "content": system_instruction_prompt},
+                {"role": "user", "content": chat_request.query},
             ],
         )
 
         return {
-            "query": request.query,
-            "response": response["message"]["content"],
+            "query": chat_request.query,
+            "response": llm_response["message"]["content"],
         }
 
-    except Exception as e:
-        logger.error(f"Query processing failed: {e}")
-        return {"error": f"Query processing failed: {str(e)}"}
+    except Exception as query_exception:
+        logger.error(f"Query processing failed: {query_exception}")
+        return {"error": f"Query processing failed: {str(query_exception)}"}
 
 
 @app.websocket("/api/chat")
-async def chat(websocket: WebSocket):
-    await websocket.accept()
+async def chat(websocket_connection: WebSocket):
+    await websocket_connection.accept()
     try:
         while True:
-            query_text = await websocket.receive_text()
+            user_message_text = await websocket_connection.receive_text()
 
             try:
-                generated_embeddings = get_vector_embeddings(query_text)
+                user_message_embeddings = get_vector_embeddings(user_message_text)
 
-                retrieved_knowledge = await get_embeddings(generated_embeddings)
+                similar_knowledge_chunks = await get_embeddings(user_message_embeddings)
                 logger.debug(
-                    f"Retrieved {len(retrieved_knowledge)} chunks from database"
+                    f"Retrieved {len(similar_knowledge_chunks)} chunks from database"
                 )
 
-                context_chunks = [embedding.chunk for embedding in retrieved_knowledge]
+                contextual_text_chunks = [
+                    knowledge_embedding.chunk
+                    for knowledge_embedding in similar_knowledge_chunks
+                ]
 
-                instruction_prompt = f"""You are a helpful chatbot.
-        Use only the following pieces of context to answer the question. Don't make up any new information:
-        {chr(10).join([f" - {chunk}" for chunk in context_chunks])}
+                system_instruction_prompt = f"""You are a helpful chatbot.
+        Use only the following pieces of context to answer the question. Don't make up any new information,
+        If the answer is not contained in the context, say "I don't know":
+        {chr(10).join([f" - {text_chunk}" for text_chunk in contextual_text_chunks])}
         """
-                buffer = []
-                flush_interval = 0.2
+                response_buffer = []
+                buffer_flush_interval = 0.2
 
-                async def flush_buffer():
-                    nonlocal buffer
-                    if buffer:
-                        await websocket.send_text("".join(buffer))
-                        buffer.clear()
+                async def flush_response_buffer():
+                    nonlocal response_buffer
+                    if response_buffer:
+                        await websocket_connection.send_text("".join(response_buffer))
+                        response_buffer.clear()
 
-                response = ollama.chat(
+                streaming_llm_response = ollama.chat(
                     model=settings.model_language,
                     messages=[
-                        {"role": "system", "content": instruction_prompt},
-                        {"role": "user", "content": query_text},
+                        {"role": "system", "content": system_instruction_prompt},
+                        {"role": "user", "content": user_message_text},
                     ],
                     stream=True,
                 )
 
-                for chunk in response:
-                    content = chunk["message"]["content"]
-                    buffer.append(content)
-                    if len(buffer) >= 5:
-                        await flush_buffer()
+                for response_chunk in streaming_llm_response:
+                    chunk_content = response_chunk["message"]["content"]
+                    response_buffer.append(chunk_content)
+                    if len(response_buffer) >= 5:
+                        await flush_response_buffer()
                     else:
-                        await asyncio.sleep(flush_interval)
+                        await asyncio.sleep(buffer_flush_interval)
 
-                await flush_buffer()
-                logger.info(f"Completed response for query: {query_text}")
+                await flush_response_buffer()
+                logger.info(f"Completed response for query: {user_message_text}")
 
-            except Exception as e:
-                logger.error(f"Chat processing failed: {e}")
-                error_message = f"Error processing your message: {str(e)}"
-                await websocket.send_text(error_message)
+            except Exception as chat_processing_exception:
+                logger.error(f"Chat processing failed: {chat_processing_exception}")
+                error_message = (
+                    f"Error processing your message: {str(chat_processing_exception)}"
+                )
+                await websocket_connection.send_text(error_message)
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
-        await websocket.close()
+        await websocket_connection.close()
